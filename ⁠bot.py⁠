@@ -1,0 +1,183 @@
+import os
+import threading
+import requests
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
+from flask import Flask
+import telebot
+from google import genai
+
+# --- FLASK SERVER ΓΙΑ ΤΟ RENDER ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "FactHub Bot is running 24/7!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+# --- ΡΥΘΜΙΣΕΙΣ & KEYS ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ΤΟ_TELEGRAM_TOKEN_ΣΟΥ")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "ΤΟ_CHAT_ID_ΣΟΥ")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "ΤΟ_GEMINI_KEY_ΣΟΥ")
+
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+ai_client = genai.Client(api_key=GEMINI_KEY)
+
+FONT_PATH = "Montserrat-Black.ttf"
+RED_COLOR = "#E50914"
+
+# Αυτόματο κατέβασμα της σωστής γραμματοσειράς με ελληνικά
+if not os.path.exists(FONT_PATH):
+    try:
+        url = "https://github.com/google/fonts/raw/main/ofl/montserrat/static/Montserrat-Black.ttf"
+        r = requests.get(url)
+        with open(FONT_PATH, "wb") as f:
+            f.write(r.content)
+    except Exception as e:
+        print(f"Font download error: {e}")
+
+# --- LIVE REDDIT SOURCING ---
+def fetch_viral_story():
+    subreddits = ["interestingasfuck", "damnthatsinteresting", "mildlyinteresting"]
+    headers = {"User-Agent": "FactHubBot/2.0 (by FactHubGR)"}
+    
+    for sub in subreddits:
+        url = f"https://www.reddit.com/r/{sub}/top.json?t=day&limit=15"
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                for post in data["data"]["children"]:
+                    pdata = post["data"]
+                    if "url" in pdata and pdata["url"].endswith((".jpg", ".png", ".jpeg")):
+                        return {
+                            "title": pdata["title"],
+                            "image_url": pdata["url"]
+                        }
+        except Exception:
+            continue
+            
+    return {
+        "title": "A massive engineering marvel discovered hidden beneath ancient structures",
+        "image_url": "https://picsum.photos/800/1000"
+    }
+
+# --- GEMINI CONTENT CREATION ---
+def process_content_with_gemini(raw_title, mode="single"):
+    if mode == "carousel":
+        prompt = f"""
+        Πάρε αυτή την είδηση: "{raw_title}"
+        1. Φτιάξε 5 σύντομες διαφάνειες στα ελληνικά με ΚΕΦΑΛΑΙΑ γράμματα για Instagram Carousel.
+        2. Χώρισε κάθε διαφάνεια αποκλειστικά με το σύμβολο '---'.
+        3. Στο τέλος βάλε μια ελκυστική λεζάντα και 5 hashtags (#facthubgr #facthub #ellada).
+        """
+    else:
+        prompt = f"""
+        Πάρε αυτή την είδηση: "{raw_title}"
+        1. Φτιάξε έναν δυνατό ελληνικό τίτλο στα ΚΕΦΑΛΑΙΑ (μέχρι 10 λέξεις). Βάλε σε αγκύλες [ ] 1-2 λέξεις που θα γίνουν κόκκινες.
+        2. Φτιάξε Instagram caption στα ελληνικά με engaging ερώτηση στο τέλος.
+        3. Πρόσθεσε hashtags: #facthubgr #facthub #perierga #ellada
+        Μορφή εξόδου:
+        TITLE: ο τίτλος εδώ
+        CAPTION: η λεζάντα εδώ
+        """
+
+    response = ai_client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=prompt
+    )
+    return response.text
+
+# --- IMAGE MAKER ---
+def create_facthub_image(image_url, title_text, slide_num=None, total_slides=None):
+    width, height = 1080, 1350
+    base_img = Image.new("RGB", (width, height), "white")
+    
+    try:
+        res = requests.get(image_url, timeout=10)
+        img = Image.open(BytesIO(res.content)).convert("RGB")
+        img = img.resize((width, 750))
+        base_img.paste(img, (0, 0))
+    except Exception:
+        pass
+
+    draw = ImageDraw.Draw(base_img)
+    
+    # Badge
+    font_badge = ImageFont.truetype(FONT_PATH, 28)
+    draw.rectangle([440, 715, 640, 765], fill="white")
+    draw.text((455, 725), "FACTHUB.GR", fill="black", font=font_badge)
+
+    # Slide Counter
+    if slide_num and total_slides:
+        font_counter = ImageFont.truetype(FONT_PATH, 26)
+        draw.text((950, 40), f"{slide_num}/{total_slides}", fill="white", font=font_counter)
+
+    # Title
+    font_title = ImageFont.truetype(FONT_PATH, 48)
+    words = title_text.replace("\n", " ").split()
+    y_text = 820
+    x_margin = 80
+    x_text = x_margin
+
+    for word in words:
+        color = "black"
+        clean_word = word
+        if "[" in word or "]" in word:
+            color = RED_COLOR
+            clean_word = word.replace("[", "").replace("]", "")
+        
+        bbox = draw.textbbox((x_text, y_text), clean_word + " ", font=font_title)
+        w = bbox[2] - bbox[0]
+        
+        if x_text + w > width - x_margin:
+            x_text = x_margin
+            y_text += 65
+            
+        draw.text((x_text, y_text), clean_word, fill=color, font=font_title)
+        x_text += w
+
+    out_io = BytesIO()
+    base_img.save(out_io, format="JPEG", quality=95)
+    out_io.seek(0)
+    return out_io
+
+# --- TELEGRAM COMMANDS ---
+@bot.message_handler(commands=["new", "single"])
+def handle_new(message):
+    bot.reply_to(message, "⏳ Δημιουργία single post σε εξέλιξη...")
+    story = fetch_viral_story()
+    ai_output = process_content_with_gemini(story["title"], mode="single")
+    
+    title = story["title"]
+    caption = ai_output
+    if "TITLE:" in ai_output and "CAPTION:" in ai_output:
+        parts = ai_output.split("CAPTION:")
+        title = parts[0].replace("TITLE:", "").strip()
+        caption = parts[1].strip()
+
+    img_io = create_facthub_image(story["image_url"], title)
+    bot.send_photo(message.chat.id, img_io, caption=caption)
+
+@bot.message_handler(commands=["carousel"])
+def handle_carousel(message):
+    bot.reply_to(message, "⏳ Δημιουργία Carousel 5 slides σε εξέλιξη...")
+    story = fetch_viral_story()
+    ai_output = process_content_with_gemini(story["title"], mode="carousel")
+    
+    slides_data = [s.strip() for s in ai_output.split("---") if s.strip()]
+    media_group = []
+    
+    total = min(len(slides_data), 5)
+    for i in range(total):
+        img_io = create_facthub_image(story["image_url"], slides_data[i], slide_num=i+1, total_slides=total)
+        media_group.append(telebot.types.InputMediaPhoto(img_io.getvalue()))
+        
+    bot.send_media_group(message.chat.id, media_group)
+
+if __name__ == "__main__":
+    threading.Thread(target=run_web, daemon=True).start()
+    bot.infinity_polling()
